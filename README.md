@@ -1,4 +1,7 @@
 # Energy-Aware Robotic 3D Printing Simulation with UR5e (ROS + MoveIt + Gazebo)
+<img width="800" height="552" alt="Demo_Printing-ezgif com-video-to-gif-converter" src="https://github.com/user-attachments/assets/88d2f8cc-1753-4f05-95d7-60fed65dab7d" />
+
+
 
 ## 📌 Overview
 
