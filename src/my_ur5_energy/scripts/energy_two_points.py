@@ -29,7 +29,7 @@ P1_XYZ_STD = [-0.5, 0.1, 0.0]
 P2_XYZ_STD = [-0.3, -0.1, 0.30]
 RPY_STD    = [np.pi/2, 0.1, np.pi - 0.1]
 
-# ===== 统一的期望关节顺序（请按需修改/核对）=====
+# ===== Unified expected joint order (modify/check as needed) =====
 JOINT_ORDER = [
     "shoulder_pan_joint",
     "shoulder_lift_joint",
@@ -69,8 +69,8 @@ class EnergyIntegrator:
         self.prev_t = None
         self.ts, self.power_pos = [], []
         self.q_list, self.qd_list, self.tau_list = [], [], []
-        self.names = None          # 固定为 JOINT_ORDER
-        self.idxmap = None         # msg.name -> JOINT_ORDER 的索引映射
+        self.names = None          # fixed as JOINT_ORDER
+        self.idxmap = None         # msg.name -> JOINT_ORDER index mapping
         self.order  = list(JOINT_ORDER)
         self._enabled = False
         self.sub = rospy.Subscriber("/joint_states", JointState, self.cb, queue_size=200)
@@ -93,13 +93,13 @@ class EnergyIntegrator:
         if not self._enabled:
             return
 
-        # --- 建立一次性顺序映射 ---
+        # --- Build one-time joint index mapping ---
         if self.idxmap is None:
             if not msg.name or len(msg.name) < self.joints_expected:
                 return
             name_to_idx = {n: i for i, n in enumerate(list(msg.name))}
             if not all(n in name_to_idx for n in self.order):
-                # 等待下一帧，直到所有目标关节都能在 /joint_states 中找到
+                # Wait for next frame until all target joints appear in /joint_states
                 return
             self.idxmap = [name_to_idx[n] for n in self.order]
             self.names = list(self.order)
@@ -108,12 +108,12 @@ class EnergyIntegrator:
 
         t = msg.header.stamp.to_sec() if msg.header.stamp else rospy.get_time()
 
-        # 按 idxmap 重排关节数组
+        # Reorder joint arrays by idxmap
         q_all   = np.asarray(msg.position, dtype=float)
         qd_all  = np.asarray(msg.velocity, dtype=float)
         tau_all = np.asarray(msg.effort,   dtype=float)
 
-        # 容错：长度不够直接跳过
+        # Safety check: skip frame if insufficient length
         if q_all.size < max(self.idxmap)+1 or qd_all.size < max(self.idxmap)+1 or tau_all.size < max(self.idxmap)+1:
             return
 
@@ -171,9 +171,9 @@ def build_path_script1_exact(arm_kind, start_std_xyz, start_std_rpy,
                              end_std_xyz, end_std_rpy,
                              cfg_num=3, v_max=0.2, a_max=0.6, num=100):
     """Generate (t, q) by linearly interpolating 6D pose and solving IK at each step.
-       返回的 q 按 JOINT_ORDER 排列。
+       Output q is in the JOINT_ORDER sequence.
     """
-    kin = Kinematics(arm_kind)  # "ur5" or "ur5e"
+    kin = Kinematics(arm_kind)
     start = np.array(list(start_std_xyz) + list(start_std_rpy), dtype=float)
     end   = np.array(list(end_std_xyz)   + list(end_std_rpy),   dtype=float)
     delta = end - start
@@ -185,7 +185,7 @@ def build_path_script1_exact(arm_kind, start_std_xyz, start_std_rpy,
     v_vec *= np.abs(delta) / nrm
     a_vec *= np.abs(delta) / nrm
 
-    # Per-axis trapezoid timing and global max total time
+    # Per-axis time allocation and global time
     acc, tot = [], []
     for i in range(6):
         ti, T = _trap_times(abs(delta[i]), float(v_vec[i]), float(a_vec[i]))
@@ -197,7 +197,7 @@ def build_path_script1_exact(arm_kind, start_std_xyz, start_std_rpy,
     num = max(int(num), 3)
     t = np.linspace(0.0, T_all, num)
 
-    # Scalar profiles S(t) for each axis
+    # Scalar profiles S(t)
     S = np.zeros((len(t), 6))
     for j in range(6):
         Tj, taj = float(tot[j]), float(acc[j])
@@ -217,7 +217,7 @@ def build_path_script1_exact(arm_kind, start_std_xyz, start_std_rpy,
             else:
                 S[k, j] = 1.0
 
-    # Linear interpolation in 6D pose and per-step IK
+    # Linear interpolation and IK
     vecs = (1.0 - S) * start + S * end
     jths = []
     prev = None
@@ -225,38 +225,36 @@ def build_path_script1_exact(arm_kind, start_std_xyz, start_std_rpy,
         ee_pose = kin.make_ee_pose(vecs[k])
         try:
             q = kin.closest_solution(ee_pose, current_joint_angles=prev, config_num=cfg_num)
-            # 这里假定 Kinematics 的返回顺序就是 JOINT_ORDER（大多数 UR 包是这样的）
+            # Assuming Kinematics returns the order consistent with JOINT_ORDER
             prev = q
         except RuntimeError:
             q = prev if prev is not None else np.zeros(6)
         jths.append(q)
-    return t, np.array(jths, dtype=float)  # q 按 JOINT_ORDER
+    return t, np.array(jths, dtype=float)
 
 # ===================== Trajectory Builder (Warmup + Velocities) =====================
 def build_traj_from_t_q(group, t, q_ordered, warmup=WARMUP_SEC, dt_min=1e-3):
     """
     Build a time-increasing JointTrajectory with an initial warmup point.
-    - q_ordered: 按 JOINT_ORDER 排列的关节角序列
-    - 根据 MoveIt 的 active joints 顺序重排再下发
+    - q_ordered: joint angles in JOINT_ORDER
+    - Reordered to MoveIt's active joint order before sending
     """
-    # MoveIt 的实际顺序
     active = group.get_active_joints()
     rospy.loginfo("[MoveIt] active joints: %s", active)
 
-    # 构造：active 顺序在 JOINT_ORDER 中的索引（将 JOINT_ORDER → active）
+    # Map JOINT_ORDER → active
     name_to_order = {n: i for i, n in enumerate(JOINT_ORDER)}
     try:
         order_to_active_idx = [name_to_order[n] for n in active]
     except KeyError as e:
         raise RuntimeError(f"Active joint {e} not found in JOINT_ORDER {JOINT_ORDER}")
 
-    # 当前机器人位姿（active 顺序）
     qcur_active = np.array(group.get_current_joint_values(), dtype=float)
 
     traj = RobotTrajectory()
     traj.joint_trajectory.joint_names = active
 
-    # 构造严格递增时间戳
+    # Build strictly increasing timestamps
     times = [0.0, float(max(0.2, warmup))]
     for i, ti in enumerate(t):
         if i == 0 and float(ti) <= 0.0:
@@ -266,7 +264,7 @@ def build_traj_from_t_q(group, t, q_ordered, warmup=WARMUP_SEC, dt_min=1e-3):
         if times[i] <= times[i - 1] + dt_min:
             times[i] = times[i - 1] + dt_min
 
-    # 将 q_ordered(按 JOINT_ORDER) 转换为 active 顺序
+    # Convert JOINT_ORDER → active order
     def ordered_to_active(q_ord):
         return np.asarray(q_ord, dtype=float)[order_to_active_idx]
 
@@ -281,7 +279,7 @@ def build_traj_from_t_q(group, t, q_ordered, warmup=WARMUP_SEC, dt_min=1e-3):
         pt.time_from_start = rospy.Duration(float(tim))
         pts.append(pt)
 
-    # 自动计算速度（中心差分）
+    # Compute velocities via central difference
     for i in range(len(pts)):
         if i == 0 or i == len(pts) - 1:
             v = np.zeros_like(q_list_active[0])
@@ -314,7 +312,7 @@ def execute_traj(group, traj):
 # ===================== FK for Visualization (Optional) =====================
 def compute_ee_from_Q(ts, Q_ordered, joint_names_ordered, planning_frame, ee_link):
     """
-    使用按 JOINT_ORDER 顺序的 Q_ordered 做 FK。
+    Compute FK using Q_ordered in JOINT_ORDER.
     """
     try:
         from moveit_msgs.srv import GetPositionFK, GetPositionFKRequest
@@ -324,7 +322,7 @@ def compute_ee_from_Q(ts, Q_ordered, joint_names_ordered, planning_frame, ee_lin
         positions = []
         for i in range(len(ts)):
             rs = RobotState()
-            rs.joint_state.name = list(joint_names_ordered)  # JOINT_ORDER
+            rs.joint_state.name = list(joint_names_ordered)
             rs.joint_state.position = Q_ordered[i, :].tolist()
             req = GetPositionFKRequest()
             req.header.frame_id = planning_frame
@@ -352,7 +350,7 @@ def compute_ee_from_Q(ts, Q_ordered, joint_names_ordered, planning_frame, ee_lin
 def cut_after_boundary(ts, Q, ppos, QD, TAU, q_boundary):
     """
     Trim data to start just after the pose closest to q_boundary.
-    Q 与 q_boundary 都需按 JOINT_ORDER。
+    Q and q_boundary must follow JOINT_ORDER.
     """
     if len(ts) == 0 or len(Q) == 0:
         return ts, ppos, Q, QD, TAU
@@ -394,7 +392,7 @@ def main():
                   np.array2string(np.array(p2_ros), precision=3),
                   np.array2string(np.array(rpy2_ros), precision=3))
 
-    # 1) Build (t, q) path consistent with "script1"  —— q 按 JOINT_ORDER
+    # 1) Build (t, q) consistent with script1  —— q follows JOINT_ORDER
     arm_kind = "ur5e"
     t_ptp, q_ptp_ordered = build_path_script1_exact(
         arm_kind,
@@ -403,7 +401,7 @@ def main():
         cfg_num=DEFAULT_CFG_ID, v_max=SCRIPT1_VMAX, a_max=SCRIPT1_AMAX, num=SCRIPT1_NUM
     )
 
-    # 2) Build trajectory (warmup + auto velocities) and execute —— 按 active 顺序下发
+    # 2) Build trajectory and execute —— sent in active order
     traj_ptp = build_traj_from_t_q(group, t_ptp, q_ptp_ordered, warmup=WARMUP_SEC, dt_min=1e-3)
 
     meter = EnergyIntegrator(joints_expected=6)
@@ -419,7 +417,7 @@ def main():
         moveit_commander.roscpp_shutdown()
         return
 
-    # 3) Trim warmup; keep only P1->P2 segment（全部按 JOINT_ORDER）
+    # 3) Trim warmup; keep only P1->P2 segment (JOINT_ORDER)
     ts, ppos, Q_ordered, QD_ordered, TAU_ordered = cut_after_boundary(
         ts, Q_ordered, ppos, QD_ordered, TAU_ordered, q_boundary=q_ptp_ordered[0]
     )
@@ -453,11 +451,12 @@ def main():
             f.write("E_pos_by_joint (J)= " + np.array2string(E_pos_by_joint, precision=6, separator=', ') + "\n")
             f.write("E_neg_by_joint (J)= " + np.array2string(E_neg_by_joint, precision=6, separator=', ') + "\n")
     rospy.loginfo("Saved energy summary to: %s", out_path)
-        # ======== Export joint positions (same dir as plots) ========
+
+    # ======== Export joint positions (same dir as plots) ========
     if len(ts) and isinstance(Q_ordered, np.ndarray) and Q_ordered.size:
         csv_path = os.path.join(figdir, "runA_q.csv")
-        header_cols = ["time_s"] + list(JOINT_ORDER)  # 列名顺序与画图一致
-        data = np.column_stack([ts.reshape(-1, 1), Q_ordered])  # 每行: t, q1..q6
+        header_cols = ["time_s"] + list(JOINT_ORDER)
+        data = np.column_stack([ts.reshape(-1, 1), Q_ordered])
         try:
             np.savetxt(csv_path, data, delimiter=",",
                        header=",".join(header_cols), comments="", fmt="%.9f")
@@ -472,7 +471,7 @@ def main():
     from scipy.signal import savgol_filter
     import itertools
 
-    # ---- Prepare smoothed signals (robust) ----
+    # ---- Prepare smoothed signals ----
     dt_med = float(np.median(np.diff(ts))) if len(ts) > 1 else 0.01
     win = max(5, int(round(0.20 / max(dt_med, 1e-3))) | 1)
 
@@ -569,7 +568,7 @@ def main():
     tau_labels = _labels("tau", TAU_ordered)
     xyz_labels = ["x", "y", "z"]
 
-    # === NEW (addition only): 规划的关节位置（IK） ===
+    # === NEW: planned joint positions (IK) ===
     if len(t_ptp) and isinstance(q_ptp_ordered, np.ndarray) and q_ptp_ordered.size:
         qplan_labels = _labels("q", q_ptp_ordered)
         _styled_plot(
